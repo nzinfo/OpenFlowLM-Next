@@ -429,6 +429,103 @@ void q4k_container_tests() {
     std::filesystem::remove(path, ec);
 }
 
+// ---- OPEN-QUANT-FLM-Q4-0: FastFlowLM's Q4_0 source (4608-byte chunks)
+constexpr size_t Q40_CH = 4608;
+constexpr uint64_t Q40_TRANSCODE_FNV1A = 0x9e55d107764fbd60ull;
+constexpr uint64_t Q40_POOL_FNV1A = 0x99fddc17b85cd7b4ull;
+const char* Q40_NAME = "model.layers.0.mlp.gate_proj.weight";
+
+/// The vector specs/open-engine/tests/test_quant_flm_q4_0.py builds byte for byte: per
+/// chunk one LCG seeded from the chunk index, 256 bf16 `d` with exponent 0x76 (finite,
+/// positive, a real weight's magnitude), then 4096 plain nibble bytes.
+std::vector<uint8_t> q4_0_vector(size_t nch) {
+    std::vector<uint8_t> out(nch * Q40_CH);
+    for (size_t c = 0; c < nch; ++c) {
+        uint32_t s = 0x9E3779B9u * static_cast<uint32_t>(c + 1);
+        uint8_t* p = out.data() + c * Q40_CH;
+        for (size_t i = 0; i < 256; ++i) {
+            s = s * 1664525u + 1013904223u;
+            const uint16_t h = static_cast<uint16_t>(0x3B00u | (s >> 24));
+            std::memcpy(p + 2 * i, &h, 2);
+        }
+        for (size_t i = 0; i < 4096; ++i) {
+            s = s * 1664525u + 1013904223u;
+            p[512 + i] = static_cast<uint8_t>(s >> 24);
+        }
+    }
+    return out;
+}
+
+/// A 4608-byte chunk's value at (row, block, lane), read straight off the layout rather
+/// than through the transcode: d[b*32 + r] * int4(nibble), the nibble in byte
+/// `k*16 + r/2` with the even row low.
+double q40_read(const uint8_t* chunk, unsigned r, unsigned b, unsigned i) {
+    const unsigned k = b * 32 + i;
+    const uint8_t byte = chunk[512 + k * 16 + r / 2];
+    const unsigned nib = (r % 2) ? (byte >> 4) : (byte & 0xF);
+    const int q = (nib < 8) ? static_cast<int>(nib) : static_cast<int>(nib) - 16;
+    uint16_t sh;
+    std::memcpy(&sh, chunk + 2 * (b * 32 + r), 2);
+    return static_cast<double>(q) * open_qwen36::bf16_to_f32(sh);
+}
+
+void q4_0_container_tests() {
+    const std::vector<uint8_t> q40 = q4_0_vector(NCH);
+    const std::vector<uint8_t> q4 = lcg_bytes(0x1234567u, NCH * Q4_CH);
+    const std::vector<uint8_t> bad = lcg_bytes(0x89ABCDEu, NCH * BAD_CH);
+    const std::string path = write_container("open_qwen36_pools_test_q4_0",
+                                             {{Q40_NAME, Q40_CH, &q40}, {Q4_NAME, Q4_CH, &q4}, {BAD_NAME, BAD_CH, &bad}});
+    open_qwen36::Q4nxFile f(path);
+    check(f.chunk_bytes(Q40_NAME) == Q40_CH, "a FLM Q4_0 tensor's chunk width is read per tensor");
+
+    // the transcode itself: unlike Q4_K it moves no value at all, so this is exact equality
+    std::vector<uint8_t> tr(NCH * Q4_CH);
+    open_qwen36::pools::q4_0_4608_to_q4_1_chunks(q40.data(), NCH, tr.data());
+    bool exact = true;
+    for (size_t c = 0; c < NCH && exact; ++c)
+        for (unsigned r = 0; r < 32 && exact; ++r)
+            for (unsigned b = 0; b < 8 && exact; ++b)
+                for (unsigned i = 0; i < 32 && exact; ++i)
+                    exact = q4_read(tr.data() + c * Q4_CH, r, b, i) == q40_read(q40.data() + c * Q40_CH, r, b, i);
+    check(exact, "q4_0_4608_to_q4_1: reads back the container's value exactly, every element");
+
+    const uint64_t gott = fnv1a(tr.data(), tr.size());
+    std::printf("      q4_0 transcode fnv1a = 0x%016llx\n", static_cast<unsigned long long>(gott));
+    check(gott == Q40_TRANSCODE_FNV1A, "q4_0_4608_to_q4_1: byte-identical to the NumPy transcode");
+
+    // as a pack source: the permutation is applied to transcoded chunks, exactly as to
+    // file chunks, and a q4_1 tensor beside it is still a verbatim copy
+    std::vector<uint8_t> pool(2 * NCH * Q4_CH, 0);
+    open_qwen36::pools::apply(std_perm_op(Q40_NAME, 0), f, 0, pool.data(), pool.size(), Q4_CH);
+    open_qwen36::pools::apply(std_perm_op(Q4_NAME, NCH * Q4_CH), f, 0, pool.data(), pool.size(), Q4_CH);
+    const auto perm = band_perm(NCH, IN_DIM);
+    bool ok0 = true, ok4 = true;
+    for (size_t c = 0; c < NCH && ok0; ++c)
+        ok0 = std::memcmp(pool.data() + c * Q4_CH, tr.data() + perm[c] * Q4_CH, Q4_CH) == 0;
+    check(ok0, "std_perm: a FLM Q4_0 source packs as the transcoded q4_1, same chunk order");
+    for (size_t c = 0; c < NCH && ok4; ++c)
+        ok4 = std::memcmp(pool.data() + (NCH + c) * Q4_CH, q4.data() + perm[c] * Q4_CH, Q4_CH) == 0;
+    check(ok4, "std_perm: a q4_1 source beside a FLM Q4_0 one is still copied chunk for chunk");
+
+    const uint64_t got = fnv1a(pool.data(), pool.size());
+    std::printf("      q4_0 pool fnv1a = 0x%016llx\n", static_cast<unsigned long long>(got));
+    check(got == Q40_POOL_FNV1A, "FLM Q4_0 / q4_1 pool: byte-identical to the NumPy packer");
+
+    // a kernel set that streams this projection at q8 is not satisfied by Q4_0
+    std::string msg;
+    try {
+        open_qwen36::pools::apply(q8_perm_op(Q40_NAME, 0), f, 0, pool.data(), pool.size(), Q4_CH);
+    } catch (const std::exception& e) {
+        msg = e.what();
+    }
+    check(msg.find("mlp.gate_proj.weight") != std::string::npos && msg.find("4608") != std::string::npos &&
+              msg.find("8704") != std::string::npos,
+          "q8_perm over a FLM Q4_0 tensor is refused, naming it (\"" + msg + "\")");
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 /// A non-unit `RowGlobal::scale` (longrope's attention factor, OPEN-FAMILY-PHI3): the
 /// whole-table builder `pools::build_ptab` matches `recipes/pack.py`'s `ptab(..., scale=)`
 /// byte for byte. This is the C++ side of a Python-only gap: `test_phi3.py`'s
@@ -956,6 +1053,7 @@ int main() {
     mixed_container_tests();
     metadata_tests();
     q4k_container_tests();
+    q4_0_container_tests();
     ptab_scale_tests();
     ptab_switch_tests();
     ktile_guard_tests();

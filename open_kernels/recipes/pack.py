@@ -33,9 +33,10 @@ kernel set it is being packed for.
 **Source forms.** The three chunk ops above (std_perm, expert_stripes, expert_down)
 accept a q8 tensor transparently and re-quantize it to q4_1 chunk by chunk on the
 way into the pool (`requant_q4_1`), and a Q4_K tensor -- what OFLM 1.0.3+ writes --
-by transcoding it (`q4k_to_q4_1`). All three forms hold the SAME 32-row x
-256-column tile, so no chunk index law changes and neither the plan, the manifest
-nor the kernels know the difference. That is what lets the Qwen3.6-35B fine-tunes
+by transcoding it (`q4k_to_q4_1`). FLM's 4608-byte Q4_0 chunk -- the one every
+NPU2 `.q4nx` FastFlowLM ships -- is transcoded the same way (`q4_0_4608_to_q4_1`).
+All four forms hold the SAME 32-row x 256-column tile, so no chunk index law changes
+and neither the plan, the manifest nor the kernels know the difference. That is what lets the Qwen3.6-35B fine-tunes
 -- q8 attention, linear-attention and shared experts, q4_1 routed experts -- and
 Qwen3.5's q8 `ssm_out_proj` run on a q4_1-only GEMV, and a 1.0.3 container run at
 all (OPEN-QUANT-Q4K). Any other chunk size is refused, naming the tensor
@@ -51,6 +52,7 @@ CH = 5120
 CH_HALF = 2560       # GPT-OSS's chunk: the same q4_1 layout over 32 rows x 128 columns
 Q8 = 8704            # a q8 chunk: 256 bf16 scales then 8192 int8 codes
 Q4K = 4736           # a Q4_K chunk (OFLM 1.0.3+): uint8 scales/mins, nibbles, one bf16 (S, M) per row
+Q40 = 4608           # FLM's Q4_0 chunk: 256 bf16 scales, then 8192 signed nibbles, no min
 BLOCK = 32           # values per quantisation block, along the input dim
 NBLOCK = 8           # 32-blocks per chunk (8192 values = 32 rows x 256 K)
 
@@ -491,21 +493,21 @@ def _chunk_bytes_of(m, name: str) -> int:
 def q4_chunks_of(m, name: str, raw, c0: int = 0, n: int | None = None) -> np.ndarray:
     """Chunks [c0, c0 + n) of `raw` as [n, 5120] q4_1 bytes, whatever the container stores.
 
-    q4_1 is a view; q8 (8704 B chunks) is re-quantized here and Q4_K (4736 B chunks) is
-    transcoded, both in batches so a 2048-chunk projection does not build a 70 MB float
-    array. Anything else is refused by name, byte count and what the count probably means
-    -- the message someone reads when they point the engine at a container this packer
-    cannot use."""
+    q4_1 is a view; q8 (8704 B chunks) is re-quantized here and Q4_K (4736 B) and FLM's
+    Q4_0 (4608 B) are transcoded, all in batches so a 2048-chunk projection does not build
+    a 70 MB float array. Anything else is refused by name, byte count and what the count
+    probably means -- the message someone reads when they point the engine at a container
+    this packer cannot use."""
     b = _u8(raw)
     ch = _chunk_bytes_of(m, name)
-    if ch not in (CH, Q8, Q4K):
-        raise ValueError(f"{name}: {ch}-byte quant chunks; the packer reads {CH} (q4_1), {Q8} (q8) "
-                         f"and {Q4K} (Q4_K) only -- {ch} is {_chunk_guess(ch)}")
+    if ch not in (CH, Q8, Q4K, Q40):
+        raise ValueError(f"{name}: {ch}-byte quant chunks; the packer reads {CH} (q4_1), {Q8} (q8), "
+                         f"{Q4K} (Q4_K) and {Q40} (FLM Q4_0) only -- {ch} is {_chunk_guess(ch)}")
     src = b.reshape(-1, ch)
     sel = src[c0:] if n is None else src[c0:c0 + n]
     if ch == CH:
         return _batched(q4_0_to_q4_1, sel) if is_signed_q4(m, name, sel) else sel
-    conv = requant_q4_1 if ch == Q8 else q4k_to_q4_1
+    conv = {Q8: requant_q4_1, Q4K: q4k_to_q4_1, Q40: q4_0_4608_to_q4_1}[ch]
     return _batched(conv, sel)
 
 
@@ -556,6 +558,38 @@ def q4_0_to_q4_1(chunks) -> np.ndarray:
     d = _bf16_to_f32(np.ascontiguousarray(src[:, :512]).view(np.uint16))
     out[:, 512:1024] = _bf16_rne(-8.0 * d).view(np.uint8).reshape(-1, 512)
     out[:, 1024:] = src[:, 1024:] ^ 0x88          # bit 3 of the low nibble and of the high
+    return out
+
+
+def q4_0_4608_to_q4_1(chunks) -> np.ndarray:
+    """[n, 4608] FLM Q4_0 chunk bytes -> [n, 5120] q4_1 chunk bytes, in the same chunk order.
+
+    FastFlowLM's Q4_0 chunk is the Q4_K chunk with the block scale promoted to bf16 and the
+    min dropped, so it is exactly 4608 B:
+
+        d[256] bf16 @ [0, 512)      index g*32 + r  (g = 32-column group, r = row)
+        qs[256][16] @ [512, 4608)   byte k*16 + r/2, even row in the low nibble
+
+    and reads as `d * int4(nibble)` -- a TWO'S COMPLEMENT nibble, -8..7, with no min. The
+    nibble raster is byte for byte Q4_K's, so this is `q4k_to_q4_1` without the two bf16
+    products: the scales are already one per (row, group) at the index q4_1 wants, and the
+    only work is the two exact steps `q4_0_to_q4_1` does plus the Q4_K de-interleave --
+
+      * bit 3 of both nibbles flips (two's complement -> offset binary, a relabelling);
+      * the min slot takes -8 * d, which moves a bf16 exponent and nothing else;
+      * byte `k*16 + h*8 + j` moves to `h*2048 + k*8 + j`, the pool's two row planes.
+
+    Nothing is re-quantized. src/open_qwen36/pools.cpp does the same and must agree byte
+    for byte (specs/open-engine/tests/test_quant_flm_q4_0.py and pools_test.cpp hash the same
+    vectors)."""
+    src = _u8(chunks).reshape(-1, Q40)
+    n = src.shape[0]
+    d = _bf16_to_f32(np.ascontiguousarray(src[:, :512]).view(np.uint16))
+    out = np.empty((n, CH), np.uint8)
+    out[:, :512] = src[:, :512]                                   # d[g*32 + r] is unchanged
+    out[:, 512:1024] = _bf16_rne(-8.0 * d).view(np.uint8).reshape(n, 512)
+    qs = src[:, 512:4608].reshape(n, 256, 2, 8)                   # [k, half, j]
+    out[:, 1024:] = qs.transpose(0, 2, 1, 3).reshape(n, CH - 1024) ^ 0x88
     return out
 
 

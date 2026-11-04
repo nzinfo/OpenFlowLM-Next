@@ -23,7 +23,11 @@
 /// A Q4_K source (4736-byte chunks, what OFLM 1.0.3+ writes) is accepted the same way and
 /// transcoded to q4_1 (`q4k_to_q4_1_chunks`). That one is nearly free: Q4_K's scale and
 /// min already have the pool's granularity and index, so only the two bf16 products
-/// round (OPEN-QUANT-Q4K). Any other chunk size is refused, naming the tensor.
+/// round (OPEN-QUANT-Q4K). FastFlowLM's 4608-byte Q4_0 chunk -- 256 bf16 scales then 8192
+/// two's-complement nibbles, no min, the same 32-row x 256-column tile and the same nibble
+/// raster as Q4_K -- is transcoded by `q4_0_4608_to_q4_1_chunks`, which is Q4_K's
+/// de-interleave with no arithmetic at all (OPEN-QUANT-FLM-Q4-0). Any other chunk size is
+/// refused, naming the tensor.
 ///
 /// A projection the kernel set streams AT q8 (the manifest carries `q8_perm` instead of
 /// `std_perm` for it) is not re-quantized at all: each 8704-byte container chunk is split
@@ -96,6 +100,18 @@ uint64_t op_bytes(const PackOp& op, size_t chunk_bytes);
 /// q4k_to_q4_1` is the same in NumPy; pools_test and tests/test_quant_q4k.py hash the
 /// same vectors (OPEN-QUANT-Q4K).
 void q4k_to_q4_1_chunks(const uint8_t* src, size_t nch, uint8_t* dst);
+
+/// `nch` FastFlowLM Q4_0 chunks (4608 B each) -> `nch` q4_1 chunks (5120 B each), in the
+/// SAME chunk order. The chunk is Q4_K's without the min and with the block scale promoted
+/// to bf16, so it is the same 32-row x 256-column tile at the same meta index `g*32 + r`:
+///   d[256] bf16 @ [0, 512)      index g*32 + r   (unchanged -- q4_1 wants the same index)
+///   qs[256][16] @ [512, 4608)   byte k*16 + r/2, even row in the low nibble
+///   value = d * int4(nibble), the nibble two's complement, -8..7, no min
+/// So the transcode is exactly `q4_0_to_q4_1_chunks`'s two exact steps -- flip bit 3 of
+/// every nibble and write min = -8 * d -- plus Q4_K's byte de-interleave. Nothing is
+/// re-quantized. `recipes/pack.py q4_0_4608_to_q4_1` is the same in NumPy; pools_test and
+/// tests/test_quant_flm_q4_0.py hash the same vectors (OPEN-QUANT-FLM-Q4-0).
+void q4_0_4608_to_q4_1_chunks(const uint8_t* src, size_t nch, uint8_t* dst);
 
 /// Signed-nibble chunks -> q4_1, in place of the same 5120 bytes: flip bit 3 of every
 /// nibble (two's complement becomes offset binary) and write min = -8 * d. Exact both

@@ -73,6 +73,11 @@ inline const std::map<std::string, SupportedModelFamily>& model_family_map() {
         {"phi4", SupportedModelFamily::phi4},
         {"nanbeige", SupportedModelFamily::nanbeige},
         {"k2", SupportedModelFamily::k2},             // IFM K2-Horizon; K2-Horizon-7B-Uno's draft pass when uno.q4nx is there
+        // Hunyuan (Hy-MT2) is dense and open-kernel only, exactly like Granite, so it
+        // reuses that adapter rather than adding a third class with the same body. The
+        // engine is the open one either way: open_kernels/recipes/families.py routes
+        // hunyuan to dense.py, and the manifest carries its own family name.
+        {"hunyuan", SupportedModelFamily::granite},
         {"whisper-v3", SupportedModelFamily::error_whiper},
         {"embed-gemma", SupportedModelFamily::error_embedding},
         {"flux2-klein", SupportedModelFamily::error_image}   // oflm image, not a chat engine

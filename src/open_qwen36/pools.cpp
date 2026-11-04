@@ -102,6 +102,7 @@ constexpr size_t Q8_CHUNK = 8704;    // 256 bf16 scales then 8192 int8 codes
 constexpr size_t Q4_CHUNK = 5120;    // 256 bf16 d, 256 bf16 m, then 4096 B of nibbles
 constexpr size_t Q4_HALF = 2560;     // GPT-OSS's chunk: the same layout over 32 rows x 128 columns
 constexpr size_t Q4K_CHUNK = 4736;   // 256 uint8 scales, 256 uint8 mins, 4096 B of nibbles, 32 bf16 S, 32 bf16 M
+constexpr size_t Q40_CHUNK = 4608;   // FLM's Q4_0: 256 bf16 scales then 4096 B of two's-complement nibbles
 constexpr size_t Q8H_SCALES = 256;   // a half-tile's 128 bf16 scales
 constexpr size_t Q8H_CODES = 4096;   // a half-tile's 4096 int8 codes
 constexpr unsigned Q8H_ROWS = 16;
@@ -213,9 +214,16 @@ const uint8_t* q4_source(const WeightFile& m, const std::string& name, size_t ch
         q4k_to_q4_1_chunks(src, nch, tmp.data());
         return tmp.data();
     }
+    if (src_ch == Q40_CHUNK && ch == Q4_CHUNK) {
+        const uint8_t* src = raw(m, name, (chunk0 + nch) * Q40_CHUNK) + chunk0 * Q40_CHUNK;
+        tmp.resize(nch * Q4_CHUNK);
+        q4_0_4608_to_q4_1_chunks(src, nch, tmp.data());
+        return tmp.data();
+    }
     fail(name + " has " + std::to_string(src_ch) + "-byte quant chunks; the packer reads " +
-         std::to_string(ch) + " (q4_1), " + std::to_string(Q8_CHUNK) + " (q8) and " +
-         std::to_string(Q4K_CHUNK) + " (Q4_K); " + std::to_string(src_ch) + " is " + chunk_guess(src_ch));
+         std::to_string(ch) + " (q4_1), " + std::to_string(Q8_CHUNK) + " (q8), " +
+         std::to_string(Q4K_CHUNK) + " (Q4_K) and " + std::to_string(Q40_CHUNK) +
+         " (FLM Q4_0); " + std::to_string(src_ch) + " is " + chunk_guess(src_ch));
 }
 
 }  // namespace
@@ -423,6 +431,28 @@ void q4k_to_q4_1_chunks(const uint8_t* src, size_t nch, uint8_t* dst) {
         for (unsigned k = 0; k < 256; ++k)
             for (unsigned h = 0; h < 2; ++h)
                 std::memcpy(o + 1024 + h * 2048 + k * 8, s + 512 + k * 16 + h * 8, 8);
+    }
+}
+
+void q4_0_4608_to_q4_1_chunks(const uint8_t* src, size_t nch, uint8_t* dst) {
+    // The chunk is Q4_K's qs region with a bf16 block scale in place of its uint8 one and no
+    // min, so d[g*32 + r] is already at the index q4_1 wants and the rest is the same byte
+    // de-interleave q4k_to_q4_1_chunks does. The nibble is two's complement, which is
+    // q4_0_to_q4_1_chunks' two exact steps: flip bit 3, and write min = -8 * d.
+    for (size_t c = 0; c < nch; ++c) {
+        const uint8_t* s = src + c * Q40_CHUNK;
+        uint8_t* o = dst + c * Q4_CHUNK;
+        std::memcpy(o, s, 512);                            // the scales are unchanged
+        for (unsigned i = 0; i < 256; ++i) {
+            uint16_t d;
+            std::memcpy(&d, s + 2 * i, 2);
+            const uint16_t mn = bf16_rne(-8.0f * bf16_to_f32(d));
+            std::memcpy(o + 512 + 2 * i, &mn, 2);
+        }
+        for (unsigned k = 0; k < 256; ++k)
+            for (unsigned h = 0; h < 2; ++h)
+                std::memcpy(o + 1024 + h * 2048 + k * 8, s + 512 + k * 16 + h * 8, 8);
+        for (size_t k = 1024; k < Q4_CHUNK; ++k) o[k] = static_cast<uint8_t>(o[k] ^ 0x88);
     }
 }
 

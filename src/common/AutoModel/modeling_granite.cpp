@@ -32,7 +32,9 @@ void Granite::load_model(std::string model_path, json model_info, int default_co
                                  "OFLM_OPEN_KERNELS_DIR at a built set.");
     auto eng = std::make_unique<open_qwen36::Engine>(*this->lm_config, this->npu_device_inst, this->MAX_L);
     eng->load_open_weights();
-    header_print("OFLM", "Granite on the open kernels (" + kernels + ")" +
+    // Name the model's own family: hunyuan (Hy-MT2) shares this adapter (model_families.hpp).
+    const std::string family = model_info.value("details", json::object()).value("family", std::string("granite"));
+    header_print("OFLM", family + " on the open kernels (" + kernels + ")" +
                              (eng->uno_ok() ? "; greedy requests (top_k 1, no penalty) decode by Uno's draft pass" : ""));
     this->lm_engine = std::move(eng);
 #else

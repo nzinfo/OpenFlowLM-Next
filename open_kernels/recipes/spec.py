@@ -34,7 +34,10 @@ QUANT_ROLES = ("attn", "linear", "linear_out", "shared", "ffn", "experts")
 QUANT_FORMATS = ("q4_1", "q4_1_f32", "q8", "mxfp4")
 DEFAULT_QUANT = "q4_1"
 NORM_GROUPS = (1, 2, 4)   # the GroupRMSNorm counts the `ln` kernels build (ln.h LN_GROUPS)
-CHUNK_FORMAT = {5120: "q4_1", 8704: "q8"}
+# 4608 is FastFlowLM's Q4_0 chunk (256 bf16 scales then 8192 two's-complement nibbles). The
+# packer transcodes it to q4_1 (`pack.q4_0_4608_to_q4_1`), exactly as it does a Q4_K chunk,
+# so the role map sees q4_1 and no kernel set has to be re-exported for it.
+CHUNK_FORMAT = {5120: "q4_1", 8704: "q8", 4608: "q4_1"}
 # 2560 is deliberately NOT in that table: GPT-OSS ships both its q4_1 projections and its
 # MXFP4 experts at that size, so the byte count alone does not name the format and only the
 # dtype separates them. A caller that has the dtypes gets the right answer; one that does

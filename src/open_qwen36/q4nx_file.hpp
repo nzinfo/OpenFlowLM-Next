@@ -62,7 +62,8 @@ public:
     /// The POOL's q4_1 chunk (5120 B) — what the packing plan's offsets are in.
     size_t chunk_bytes() const { return chunk_bytes_; }
     /// The quantized chunk size `name` is stored in: its last shape dimension for an
-    /// I8 tensor (5120 = q4_1, 8704 = q8), 0 when the tensor is not quantized.
+    /// I8 tensor (5120 = q4_1, 8704 = q8, 4736 = Q4_K, 4608 = FastFlowLM's Q4_0), 0 when
+    /// the tensor is not quantized. The packer transcodes the last two to q4_1.
     size_t chunk_bytes(const std::string& name) const;
     const std::string& path() const { return path_; }
     /// How many tensors the header lists, so a loader can say when a container holds more

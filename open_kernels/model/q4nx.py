@@ -8,6 +8,12 @@ plain row-major. Quantized tensors are packed chunks of 8192 values:
   nibbles, block size 32 along the input dim, 16-lane interleaved --
     nibble[(r//16)*4096 + bc*512 + i*16 + (r%16)] = element (row r, col bc*32+i)
   q8 chunk, 8704 B (lm_head only): 256 bf16 scales, then 8192 int8.
+  Q4_K chunk, 4736 B: uint8 scales/mins, nibbles, one bf16 (S, M) per row (`dq_chunks_q4_k`).
+  FLM Q4_0 chunk, 4608 B: 256 bf16 scales `d`, then 4096 B of TWO'S COMPLEMENT nibbles,
+  block size 32 along the input dim, one scale per (row, 32-column group) at index
+  `g*32 + r`, and Q4_K's nibble raster -- byte `k*16 + r/2`, even row in the low nibble,
+  so `w = d * int4(q)` with no min (`dq_chunks_q4_0`). This is what every NPU2 `.q4nx`
+  FastFlowLM ships; the packer transcodes it to q4_1 (`pack.q4_0_4608_to_q4_1`).
 
 In the file, chunk f of a [out, in] tensor covers rows 32*(f//ncol) and cols
 256*(f%ncol) -- plain raster. (The NPU weight pools reorder those chunks; the
@@ -51,6 +57,7 @@ import numpy as np
 CHUNK_Q4 = 5120
 CHUNK_Q8 = 8704
 CHUNK_Q4K = 4736
+CHUNK_Q40 = 4608        # FastFlowLM's Q4_0 chunk: bf16 scales then two's-complement nibbles
 
 
 def _pack_fn(name):
@@ -78,6 +85,11 @@ def _q4k_to_q4_1(chunks):
 def _q4_0_to_q4_1(chunks):
     """recipes.pack's signed-nibble -> q4_1."""
     return _pack_fn("q4_0_to_q4_1")(chunks)
+
+
+def _q4_0_4608_to_q4_1(chunks):
+    """recipes.pack's FLM Q4_0 -> q4_1."""
+    return _pack_fn("q4_0_4608_to_q4_1")(chunks)
 
 
 def _is_signed_q4(m, name, chunks):
@@ -169,6 +181,27 @@ def dq_chunks_q4_k(chunks):
     return nib * d[..., None] + m[..., None]
 
 
+def dq_chunks_q4_0(chunks):
+    """[n, 4608] raw FLM Q4_0 chunk bytes -> [n, 32, 8, 32] f32 (row, block, lane).
+
+    The container's own values, with no transcode. FastFlowLM's chunk is the Q4_K one with
+    the block scale promoted to bf16 and the min dropped, so it is the same 32-row x
+    256-column tile at the same meta index `g*32 + r`:
+
+        d[256] bf16 @ [0, 512)      index g*32 + r
+        qs[256][16] @ [512, 4608)   byte k*16 + r/2, even row in the low nibble
+        value = d * int4(nibble), the nibble two's complement, -8..7, no min
+    """
+    chunks = np.asarray(chunks, np.uint8).reshape(-1, CHUNK_Q40)
+    nch = chunks.shape[0]
+    d = bf16_to_f32(np.ascontiguousarray(chunks[:, :512]).view(np.uint16)).reshape(nch, 8, 32)
+    qs = chunks[:, 512:4608].reshape(nch, 256, 16)                                    # [n, k, r//2]
+    r = np.arange(32)
+    nib = np.where(r % 2 == 0, qs[:, :, r // 2] & 0xF, qs[:, :, r // 2] >> 4).astype(np.int32)
+    nib = np.where(nib < 8, nib, nib - 16).astype(np.float32)                         # [n, k, r]
+    return nib.transpose(0, 2, 1).reshape(nch, 32, 8, 32) * d.transpose(0, 2, 1)[..., None]
+
+
 class Q4NX:
     def __init__(self, path):
         self.path = str(path)
@@ -187,8 +220,9 @@ class Q4NX:
         return self.requant_q8 and not self.native_q8(name)
 
     def chunk_bytes_of(self, name):
-        """The quantized chunk size `name` is stored in (5120 = q4_1, 8704 = q8), 0 when the
-        tensor is not quantized. recipes/pack.py probes for this method."""
+        """The quantized chunk size `name` is stored in (5120 = q4_1, 8704 = q8, 4736 =
+        Q4_K, 4608 = FastFlowLM's Q4_0), 0 when the tensor is not quantized.
+        recipes/pack.py probes for this method."""
         t = self.tensors[name]
         return t["shape"][-1] if t.get("dtype") == "I8" and t.get("shape") else 0
 
@@ -196,8 +230,8 @@ class Q4NX:
         guess = (f"a smaller chunk geometry ({cb * 8192 // CHUNK_Q4} values per chunk instead of 8192)"
                  if cb in (1280, 2560) else "not a chunk format this reader knows")
         raise RuntimeError(f"{self.path}: {name} has {cb}-byte quant chunks; this reader handles "
-                           f"{CHUNK_Q4} (q4_1), {CHUNK_Q8} (q8) and {CHUNK_Q4K} (Q4_K) only "
-                           f"-- {cb} is {guess}")
+                           f"{CHUNK_Q4} (q4_1), {CHUNK_Q8} (q8), {CHUNK_Q4K} (Q4_K) and "
+                           f"{CHUNK_Q40} (FLM Q4_0) only -- {cb} is {guess}")
 
     def raw(self, name):
         o0, o1 = self.tensors[name]["data_offsets"]
@@ -258,6 +292,10 @@ class Q4NX:
             w = dq_chunks_q4_1(_q4k_to_q4_1(b.reshape(-1, CHUNK_Q4K)))
         elif chunk == CHUNK_Q4K:
             w = dq_chunks_q4_k(b)
+        elif chunk == CHUNK_Q40 and requant:
+            w = dq_chunks_q4_1(_q4_0_4608_to_q4_1(b.reshape(-1, CHUNK_Q40)))
+        elif chunk == CHUNK_Q40:
+            w = dq_chunks_q4_0(b)
         else:
             self._refuse("<raw bytes>", chunk)
         w = w.reshape(-1, 32, 256)
@@ -277,7 +315,7 @@ class Q4NX:
 
     def matmul_w(self, name, out_dim, in_dim):
         cb = self.chunk_bytes_of(name)
-        if cb not in (CHUNK_Q4, CHUNK_Q8, CHUNK_Q4K):
+        if cb not in (CHUNK_Q4, CHUNK_Q8, CHUNK_Q4K, CHUNK_Q40):
             self._refuse(name, cb)
         signed = (cb == CHUNK_Q4 and _is_signed_q4(self, name, np.frombuffer(self.raw(name), np.uint8)
                                                    .reshape(-1, CHUNK_Q4)))
@@ -287,7 +325,7 @@ class Q4NX:
         """One expert's `kind` ('up' | 'gate' | 'down') matrix, dequantized."""
         name = f"model.layer.{layer}.mlp.{kind}_exps_proj.weight"
         cb = self.chunk_bytes_of(name)
-        if cb not in (CHUNK_Q4, CHUNK_Q8, CHUNK_Q4K):
+        if cb not in (CHUNK_Q4, CHUNK_Q8, CHUNK_Q4K, CHUNK_Q40):
             self._refuse(name, cb)
         stride = 128 * cb
         b = np.frombuffer(self.raw(name), dtype=np.uint8)
