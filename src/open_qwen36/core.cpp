@@ -631,7 +631,7 @@ for (const PackOp& o : gw.pack) bytes = std::max<size_t>(bytes, o.dst + pools::o
                 // f32, from the file by name as the full layers' does. The consts plan `put`s the
                 // same bf16 bytes for the dxB kernel, so both routes norm with one weight.
                 const AttnBlock& ab = lt.gemm_block.attn_block;
-                if (ab.prep == "qknorm_rope") {
+                if (ab.prep == "qknorm_rope" || ab.prep == "rope_qknorm") {
                     HostConsts& h = hc_[l];
                     h.qn = file_->bf16(const_tensor(lt, "q_norm.weight", l));
                     h.kn = file_->bf16(const_tensor(lt, "k_norm.weight", l));
@@ -2514,7 +2514,8 @@ void Core::dense_attention_block(int l, const std::vector<float>& y_qkv3, size_t
     const size_t qw = gb.qw, kvw = gb.kvw, hd = ab.hd;
     // The geometry the products were built for, against what this layer's projection produces;
     // attention_npu checks m against the group size times T.
-    const bool qknorm = ab.prep == "qknorm_rope";
+    const bool qknorm = ab.prep == "qknorm_rope" || ab.prep == "rope_qknorm";
+    const bool post = ab.prep == "rope_qknorm";
     if ((!qknorm && ab.prep != "rope") || qw % hd || kvw % hd || (qw / hd) % (kvw / hd) || w_->rotary_dim > hd ||
         (qknorm && (hc.qn.size() != hd || hc.kn.size() != hd)))
         throw std::runtime_error("open_qwen36: layer " + std::to_string(l) + ": the dense attention products were built for "
@@ -2539,7 +2540,7 @@ void Core::dense_attention_block(int l, const std::vector<float>& y_qkv3, size_t
     g.pos0 = pos0; g.eps = gb.eps;
     tt = std::chrono::steady_clock::now();
     float* Q = BlockScratch::fit(bs_.qrope, T * qw);
-    host::attention_prep(g, q, k, v, qknorm ? hc.qn.data() : nullptr, qknorm ? hc.kn.data() : nullptr,
+    host::attention_prep(g, q, k, v, qknorm ? hc.qn.data() : nullptr, qknorm ? hc.kn.data() : nullptr, post,
                          w_->rope_inv_freq.data(), st.map<uint16_t*>(), row / 2, Q);
     timing_.mid_ms += ms_since(tt);
     og.assign(T * qw, 0.f);
@@ -3397,7 +3398,7 @@ void Core::block_layer_full(int l, float* xres, size_t T, size_t t_real, size_t 
     auto t0 = std::chrono::steady_clock::now();
     if (attn_block_on_ && gb.attn_block.present()) {
         float* Q = BlockScratch::fit(bs_.qrope, T * qw);
-        host::attention_prep(g, q, k, v, hc.qn.data(), hc.kn.data(), w_->rope_inv_freq.data(),
+        host::attention_prep(g, q, k, v, hc.qn.data(), hc.kn.data(), false, w_->rope_inv_freq.data(),
                              st.map<uint16_t*>(), row / 2, Q);
         timing_.part1_ms += ms_since(t0);
         timing_.mid_ms += ms_since(t0);
@@ -3686,7 +3687,7 @@ void Core::layer_full_staged(int l, float* xres, size_t B, size_t T, size_t N, s
                    const host::AttnGeom g = geom(b);
                    auto t0 = std::chrono::steady_clock::now();
                    if (npu_attn)
-                       host::attention_prep(g, q, k, v, hc.qn.data(), hc.kn.data(), man_.rope_inv_freq.data(),
+                       host::attention_prep(g, q, k, v, hc.qn.data(), hc.kn.data(), false, man_.rope_inv_freq.data(),
                                             st.map<uint16_t*>(), row / 2, q_all + b * T * qw);
                    else
                        host::attention_block(g, q, k, v, gate, hc.qn.data(), hc.kn.data(), man_.rope_inv_freq.data(),

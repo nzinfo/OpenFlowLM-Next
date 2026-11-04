@@ -399,14 +399,15 @@ int main(int argc, char** argv) {
         const auto inv_freq = read<double>(dir, "inv_freq.f64");
         const auto kv_in = read<float>(dir, "kv.f32");
         const size_t qw = g.nh * g.hd, kv_row = 2 * g.kvh * g.hd;
-        struct Prep { const char* name; bool normed; const char* q_ref; const char* kv_ref; };
-        for (const Prep& c : {Prep{"qknorm_rope", true, "out_q_prep_qknorm.f32", "out_kv.f32"},
-                              Prep{"rope", false, "out_q_prep_rope.f32", "out_kv_prep_rope.f32"}}) {
+        struct Prep { const char* name; bool normed; bool post; const char* q_ref; const char* kv_ref; };
+        for (const Prep& c : {Prep{"qknorm_rope", true, false, "out_q_prep_qknorm.f32", "out_kv.f32"},
+                              Prep{"rope_qknorm", true, true, "out_q_prep_rope_qknorm.f32", "out_kv_prep_qknorm.f32"},
+                              Prep{"rope", false, false, "out_q_prep_rope.f32", "out_kv_prep_rope.f32"}}) {
             const std::string tag = std::string("attention_prep (") + c.name + "): ";
             auto kv = to_bf16(kv_in);
             std::vector<float> Q(T * qw, 9.f);     // stale rows the padding past t_real has to clear
             host::attention_prep(g, q.data(), k.data(), v.data(), c.normed ? qn.data() : nullptr,
-                                 c.normed ? kn.data() : nullptr, inv_freq.data(), kv.data(), kv_row, Q.data());
+                                 c.normed ? kn.data() : nullptr, c.post, inv_freq.data(), kv.data(), kv_row, Q.data());
             const double e1 = maxrel(Q, read<float>(dir, c.q_ref));
             const double e2 = maxrel(from_bf16(kv), read<float>(dir, c.kv_ref));
             check(e1 < tol, tag + "Q roped and scaled by 1/sqrt(hd) vs replica_block (maxrel " + std::to_string(e1) + ")");

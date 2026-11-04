@@ -109,8 +109,8 @@ struct AttnBlock {
     std::vector<std::string> args;                         ///< the a / b / c globals
     size_t m = 0, hd = 0, l_max = 0;                       ///< rows per product (heads per kv head x T), head dim
     /// A dense layer's host half before the products: "qknorm_rope" (q/k RMSNorm, then the
-    /// half-split rotation; no bias, no gate) or "rope" (the rotation alone). Empty on a
-    /// full-attention layer, whose is fixed.
+    /// half-split rotation), "rope_qknorm" (the rotation first, then the q/k RMSNorm, HunYuan)
+    /// or "rope" (the rotation alone). Empty on a full-attention layer, whose is fixed.
     std::string prep;
     bool present() const { return !kernels_s.empty(); }
 };

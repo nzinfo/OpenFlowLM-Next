@@ -103,9 +103,12 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
 /// normed and roped with 1/sqrt(hd) folded in (a power of two at every head dim here, so the
 /// bf16 the kernel sees rounds exactly as the unscaled value would); the block's k / v normed,
 /// roped and written to the cache rows [pos0, pos0 + t_real) in bf16. Rows of Q past t_real are zero.
-/// A null qn / kn skips that norm (a family with no q/k norm, prep "rope").
+/// A null qn / kn skips that norm (a family with no q/k norm, prep "rope"). `qknorm_after_rope`
+/// swaps the two for a family that rotates first (HunYuan, prep "rope_qknorm"), as the dxB
+/// kernel's QKNORM_POST does.
 void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
-                    const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems, float* Q);
+                    const float* kn, bool qknorm_after_rope, const double* inv_freq, uint16_t* kv, size_t kv_row_elems,
+                    float* Q);
 
 /// rows [n, k] bf16, `stride` elements apart (the cache's K or V half), as the GEMM's tiled B for
 /// B = rows^T [k, n] -- tile_x's layout from a bf16 source. Rows at or past n_real read as zero;

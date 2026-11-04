@@ -4329,12 +4329,14 @@ context twice a layer rather than twice a head.
 
 The `dense` route runs the same products in place of its T single-token `dxB`
 dispatches, for a layer type whose `attn_block` carries `prep`: what the
-products' host half has to compute for that family. There are two values:
+products' host half has to compute for that family. There are three values:
 `qknorm_rope` (the q / k RMSNorm, then the half-split rotation over the
 manifest's `rotary_dim`; no bias, no gate, no sliding window), declared by
-`recipes/dense.py` for the families in `BLOCK_ATTN_QKNORM_ROPE`, and `rope`
+`recipes/dense.py` for the families in `BLOCK_ATTN_QKNORM_ROPE`, `rope_qknorm`
+(the rotation first and the q / k RMSNorm after, HunYuan's order, which its
+`dxB` kernel runs as `QKNORM_POST`), for `BLOCK_ATTN_ROPE_QKNORM`, and `rope`
 (the same rotation with no q / k norm), for the families in `BLOCK_ATTN_ROPE`.
-A family joins either list by measurement against its `dxB` route; one in
+A family joins a list by measurement against its `dxB` route; one in
 neither gets no `attn_block` and builds no `ag_*` kernels. A dense
 `attn_block` without `prep` (an older kernel set's) is not read, and the route
 keeps its `dxB` dispatches; a `prep` the engine does not know is refused. At head dim 128 the
@@ -4349,10 +4351,10 @@ error by splitting q (`attn.h`, `attn_q_impl`). P stays a single bf16.
 **Acceptance criteria (unit):**
 - The 35B emission: the full-attention type carries `attn_block` = `m` 2048, `hd` 256, `l_max` 4096, args `ag_a, ag_b, ag_c`, streams `ag_s<L>` / `ag_pv<L>` for L = 256 .. 4096 by 256 on context `ag`; the builds pass `AG_M`, `AG_K`, `AG_N` (K = hd, N = L for the scores; K = L, N = hd for the values); the globals are sized for the widest window; the linear type carries none (`test_prefill_attn.py`).
 - The parser (`manifest_test.cpp`): `m`, `hd` and `l_max` positive multiples of 256, three args that are declared globals, every window a positive multiple of 256 within `l_max`, `kernels_s` reaching `l_max`, and `kernels_s` / `kernels_pv` covering the same windows; the fixture parses to 16 windows of each on the full type only.
-- The dense emission (`test_prefill_attn.py`): Qwen3-4B's dense type carries `attn_block` with `m` 1024 (4 query heads per kv head x 256), `hd` 128, `l_max` 4096 and `prep` `qknorm_rope`; K2-Horizon 7B and 3.7B carry `m` 1024, `hd` 128 and `prep` `rope`; Llama 3.1 (no q / k norm, not yet measured), HunYuan (the norm after the rotation), Phi-4-mini and Granite (not yet measured) carry no `attn_block` and build no `ag_*` kernels.
+- The dense emission (`test_prefill_attn.py`): Qwen3-4B's dense type carries `attn_block` with `m` 1024 (4 query heads per kv head x 256), `hd` 128, `l_max` 4096 and `prep` `qknorm_rope`; K2-Horizon 7B and 3.7B carry `m` 1024, `hd` 128 and `prep` `rope`; HunYuan's 7B carries the same `m` / `hd` with `prep` `rope_qknorm`; Llama 3.1 (no q / k norm, not yet measured), Phi-4-mini and Granite (not yet measured) carry no `attn_block` and build no `ag_*` kernels.
 - Under `AG16=1` (`test_prefill_attn.py`): K2-Horizon 7B and 3.7B carry no `attn_block` and build no `ag*` kernels -- that set's 16-row B tile is not one the engine packs (`block_host.cpp` tiles by (64, 32), and the parser reads no `n_tile`).
-- The host half (`block_host_test.cpp`, against `replica_block.py`'s `attention_prep`): at both `prep`s (null qn / kn for `rope`), Q roped and scaled to 1e-4, the block's KV rows within a bf16 ulp, Q's rows past `t_real` zero and the cache rows outside the block untouched, on a block that starts past row 0, holds fewer real tokens than T and rotates part of the head.
-- The dense parser (`manifest_test.cpp`): the Qwen3-4B fixture's dense `attn_block` parses with `prep` `qknorm_rope`, `hd` 128 and 16 windows on contexts `ag_s` / `ag_pv`; the same fixture with `prep` `rope` parses; a `prep` other than `qknorm_rope` or `rope` is refused; HunYuan's `attn_block` without `prep` is not read.
+- The host half (`block_host_test.cpp`, against `replica_block.py`'s `attention_prep`): at all three `prep`s (null qn / kn for `rope`), Q roped and scaled to 1e-4, the block's KV rows within a bf16 ulp, Q's rows past `t_real` zero and the cache rows outside the block untouched, on a block that starts past row 0, holds fewer real tokens than T and rotates part of the head.
+- The dense parser (`manifest_test.cpp`): the Qwen3-4B fixture's dense `attn_block` parses with `prep` `qknorm_rope`, `hd` 128 and 16 windows on contexts `ag_s` / `ag_pv`; the same fixture with `prep` `rope` or `rope_qknorm` parses; a `prep` other than those three is refused; HunYuan's `attn_block` without `prep` is not read.
 
 **Procedure:** as `tests/test_prefill_attn.py` documents -- the harness run at L = 2048 (`make_test.py --L 2048`, the two builds, `compare.py s2048` / `pv2048`, gate rel_fro <= 5e-3) and the full-model checks of `OPEN-PREFILL-BATCH` steps 3 and 4 on a prefix with a full-attention layer, with and without `OFLM_OPEN_ATTN_BLOCK=0`, then `oflm-test --llm` through `oflm serve` with `OFLM_OPEN_GEMM_BLOCK=1`. For a dense family, whatever its `prep`: `utilities/dense-decode-probe/attn_route_check.py` on its whole model (19, 64, 600 and 981 tokens, `--seq` on the short ones) -- the products against its `dxB` route at the argmax of every compared position and the same greedy continuation at every length, and logits corr >= 0.9998, the distance its `dxB` route already keeps from the sequential one, at every length the app sends down the block route (`OFLM_OPEN_GEMM_BLOCK_MIN`, 64 tokens, and longer); a shorter prompt's corr is recorded, not gated. That is the whole bar, with no family excepted: the teacher-forced NLL, KL and top-1 figures some results below record are diagnostics with no threshold, never a pass in place of it. Then `oflm-test --llm` as above.
 

@@ -456,7 +456,8 @@ void attention_block(const AttnGeom& g, const float* q, const float* k, const fl
 }
 
 void attention_prep(const AttnGeom& g, const float* q, const float* k, const float* v, const float* qn,
-                    const float* kn, const double* inv_freq, uint16_t* kv, size_t kv_row_elems, float* Q) {
+                    const float* kn, bool qknorm_after_rope, const double* inv_freq, uint16_t* kv, size_t kv_row_elems,
+                    float* Q) {
     const size_t qw = g.nh * g.hd, kvw = g.kvh * g.hd, half = g.rot / 2, R = g.t_real;
     if (g.nh % g.kvh || g.t_real > g.T || g.rot > g.hd || kv_row_elems < 2 * kvw)
         throw std::runtime_error("open_qwen36: attention_prep: inconsistent geometry");
@@ -471,16 +472,19 @@ void attention_prep(const AttnGeom& g, const float* q, const float* k, const flo
         for (size_t h = 0; h < g.nh; ++h) {
             float* dst = Q + t * qw + h * g.hd;
             const float* src = q + t * qw + h * g.hd;
-            if (qn) rms_vec(src, g.hd, qn, g.eps, dst);
+            if (qn && !qknorm_after_rope) rms_vec(src, g.hd, qn, g.eps, dst);
             else std::copy(src, src + g.hd, dst);
             rope(dst, half, inv_freq, static_cast<double>(p));
+            if (qn && qknorm_after_rope) rms_vec(dst, g.hd, qn, g.eps, dst);
             for (size_t j = 0; j < g.hd; ++j) dst[j] *= scale;
         }
         for (size_t h = 0; h < g.kvh; ++h) {
             const float* src = k + t * kvw + h * g.hd;
-            if (kn) rms_vec(src, g.hd, kn, g.eps, kh.data() + h * g.hd);
-            else std::copy(src, src + g.hd, kh.data() + h * g.hd);
-            rope(kh.data() + h * g.hd, half, inv_freq, static_cast<double>(p));
+            float* dst = kh.data() + h * g.hd;
+            if (kn && !qknorm_after_rope) rms_vec(src, g.hd, kn, g.eps, dst);
+            else std::copy(src, src + g.hd, dst);
+            rope(dst, half, inv_freq, static_cast<double>(p));
+            if (kn && qknorm_after_rope) rms_vec(dst, g.hd, kn, g.eps, dst);
         }
         for (size_t j = 0; j < kvw; ++j) {
             kv[p * kv_row_elems + j] = f32_to_bf16(kh[j]);

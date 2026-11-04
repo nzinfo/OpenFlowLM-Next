@@ -458,6 +458,14 @@ int main(int argc, char** argv) {
                 const Manifest r = Manifest::parse(rj, "edited");
                 check(r.layer_types.at("dense").gemm_block.attn_block.prep == "rope", "k2 shape: prep rope (no q/k norm) parses");
             }
+            {
+                std::ifstream rf(argv[2]);
+                json rj = json::parse(rf);
+                rj["layer_types"]["dense"]["gemm_block"]["attn_block"]["prep"] = "rope_qknorm";
+                const Manifest r = Manifest::parse(rj, "edited");
+                check(r.layer_types.at("dense").gemm_block.attn_block.prep == "rope_qknorm",
+                      "hunyuan shape: prep rope_qknorm (rotation, then q/k norm) parses");
+            }
             // a single-layer-type, non-sandwich family gets the schema's defaults, unchanged
             // from before attn_kernel / attn_args / sandwich / act existed (backward compat)
             check(dg.attn_kernel == "dxB" && dg.attn_args.back() == "ptab" && !dg.sandwich && dg.act == "silu",
@@ -529,8 +537,10 @@ int main(int argc, char** argv) {
             check(h.hidden == 4096 && h.kv_row == 4096 && h.rotary_dim == 128, "hunyuan: layout");
             // the head is padded to whole 64-row bands (128192); the ids stop at the tokenizer's count
             check(h.vocab == 128192 && h.real_vocab == 128166 && h.lmhead_ops[0].nch == 64096, "hunyuan: padded head, real vocab");
-            // its norm follows the rotation, which the products' host half does not do: no prep, so no products
-            check(!h.layer_types.at("dense").gemm_block.attn_block.present(), "hunyuan: no prep, no attn_block");
+            // its norm follows the rotation: prep "rope_qknorm", which the products' host half
+            // now does, so the block route is present instead of falling back to dxB
+            const auto& hab = h.layer_types.at("dense").gemm_block.attn_block;
+            check(hab.present() && hab.prep == "rope_qknorm", "hunyuan: rope_qknorm, so the products carry it");
             {   // an older kernel set still carries one without a prep: it is not read, the route keeps dxB
                 std::ifstream qf(argv[2]), hf(argv[4]);
                 json qj = json::parse(qf), hj = json::parse(hf);
