@@ -40,15 +40,15 @@ gives corr 0.05 against bf16).
 ```bash
 cd works/openflowlm-next
 source utilities/env.sh
-OPEN_KERNELS_UNVALIDATED=1 python open_kernels/export_qwen36_kernels.py \
+python open_kernels/export_qwen36_kernels.py \
     --model-dir /home/nzinfo/src.npu/amd_npu/models/Hy-MT2-1.8B-NPU2 \
     --out src/xclbins/Hy-MT2-1.8B-NPU2/open_kernels -j 4
 ```
 
-`OPEN_KERNELS_UNVALIDATED=1` is required: the attention tuple
-`(hd 128, 16 heads, 4 kv, rot 128, qk_norm, no gate, post-rope norm)` is not in
-`catalogue.py`. The route's output is measured against FastFlowLM (below), but
-the point has not been entered in the catalogue.
+The attention tuple `(hd 128, 16 heads, 4 kv, rot 128, qk_norm, no gate,
+post-rope norm)` entered `catalogue.py` on 2026-11-05 after the hardware run
+below, so `OPEN_KERNELS_UNVALIDATED=1` is no longer needed. A *new* HunYuan
+size (the 7B's 32/8 is already there) would need it until measured.
 
 The `ag_s<L>` / `ag_pv<L>` builds are **content-cached and shared**: 1.8B's
 `m = (16/4) * 256 = 1024`, `hd = 128` is exactly Qwen3-4B's attention
